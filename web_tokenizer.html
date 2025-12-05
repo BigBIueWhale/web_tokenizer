@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <!-- 
-    https://chatgpt.com/share/6932cf09-6e4c-800a-b81f-701523fb70d8
+    https://chatgpt.com/share/69336002-cb00-800a-b86b-3600d37f513e
 -->
 <html lang="en">
 <head>
@@ -658,9 +658,11 @@
         const tokenState = {
             segments: [],
             lineCharIndices: [], // Maps Line Number -> First Char Index of that line
-            tokenEndIndices: null, // Maps Token Index -> End Char Index
+            tokenStartIndices: null, // Maps Token Index -> Start Char Index
+            tokenEndIndices: null,   // Maps Token Index -> End Char Index (exclusive)
             totalLines: 0,
             textSnapshot: "",
+            textLength: 0, // Snapshot length for boundary checks
             isSynced: false
         };
         
@@ -741,6 +743,7 @@
         function rebuildTokenState(text, segments) {
             tokenState.segments = Array.isArray(segments) ? segments.slice() : [];
             tokenState.textSnapshot = text;
+            tokenState.textLength = text.length;
             
             // 1. Map Line -> Start Char
             tokenState.lineCharIndices = [0];
@@ -751,10 +754,13 @@
             }
             tokenState.totalLines = tokenState.lineCharIndices.length;
     
-            // 2. Map Token -> End Char
-            tokenState.tokenEndIndices = new Uint32Array(tokenState.segments.length);
+            // 2. Map Token -> Start/End Char (exclusive)
+            const len = tokenState.segments.length;
+            tokenState.tokenStartIndices = new Uint32Array(len);
+            tokenState.tokenEndIndices = new Uint32Array(len);
             let runningLength = 0;
-            for (let i = 0; i < tokenState.segments.length; i++) {
+            for (let i = 0; i < len; i++) {
+                tokenState.tokenStartIndices[i] = runningLength;
                 runningLength += tokenState.segments[i].length;
                 tokenState.tokenEndIndices[i] = runningLength;
             }
@@ -773,19 +779,70 @@
             return Math.max(0, high);
         }
     
+        // Returns the index of the token whose span covers charIndex,
+        // clamped to [0, lastToken]. If charIndex is before the first
+        // token, returns 0. If it is at or beyond the end of the text,
+        // returns the last token index.
         function findTokenIndexForChar(charIndex) {
+            const ends = tokenState.tokenEndIndices;
+            const n = ends ? ends.length : 0;
+            if (n === 0) return 0;
+
+            // Clamp to valid character range
+            if (charIndex <= 0) return 0;
+
+            const lastEnd = ends[n - 1];
+
+            // If we are at or past the end of the text, treat this as the last token
+            if (charIndex >= lastEnd) return n - 1;
+
             let left = 0;
-            let right = tokenState.tokenEndIndices.length - 1;
+            let right = n - 1;
             while (left <= right) {
                 const mid = (left + right) >>> 1;
-                const start = mid === 0 ? 0 : tokenState.tokenEndIndices[mid - 1];
-                const end = tokenState.tokenEndIndices[mid];
-                
-                if (charIndex >= start && charIndex < end) return mid;
-                else if (charIndex < start) right = mid - 1;
-                else left = mid + 1;
+                const start = mid === 0 ? 0 : ends[mid - 1];
+                const end = ends[mid];
+
+                if (charIndex < start) {
+                    right = mid - 1;
+                } else if (charIndex >= end) {
+                    left = mid + 1;
+                } else {
+                    return mid;
+                }
             }
-            return 0;
+            // Fallback: best-effort clamp
+            return Math.max(0, Math.min(n - 1, left));
+        }
+
+        // Returns the index of the first token whose start position is
+        // greater than or equal to charIndex. If charIndex is after the
+        // last token, returns tokenState.segments.length (exclusive upper bound).
+        function findFirstTokenIndexAtOrAfterChar(charIndex) {
+            const starts = tokenState.tokenStartIndices;
+            const ends = tokenState.tokenEndIndices;
+            const n = starts ? starts.length : 0;
+            if (n === 0) return 0;
+
+            const lastEnd = ends[n - 1];
+
+            if (charIndex <= 0) return 0;
+            if (charIndex >= lastEnd) return n;
+
+            let left = 0;
+            let right = n - 1;
+            let result = n;
+
+            while (left <= right) {
+                const mid = (left + right) >>> 1;
+                if (starts[mid] >= charIndex) {
+                    result = mid;
+                    right = mid - 1;
+                } else {
+                    left = mid + 1;
+                }
+            }
+            return result;
         }
     
         // --- VIRTUALIZATION LOGIC ---
@@ -797,6 +854,9 @@
     
         function applyVirtualViewport() {
             if (!tokenState.segments.length) {
+                // Reset spacers and tokens when empty
+                if (els.tokenTopSpacer) els.tokenTopSpacer.style.height = '0px';
+                if (els.tokenBottomSpacer) els.tokenBottomSpacer.style.height = '0px';
                 renderVisualizer([], 0);
                 return;
             }
@@ -815,39 +875,49 @@
             let safeStartLine = Math.max(0, startLine - OVERSCAN);
             let safeEndLine = Math.min(tokenState.totalLines, endLine + OVERSCAN);
 
+            // Clamp start so it's always a valid line index
+            if (tokenState.totalLines > 0) {
+                safeStartLine = Math.min(safeStartLine, tokenState.totalLines - 1);
+            }
+
+            // Ensure we always have at least one line in the window
+            if (safeEndLine <= safeStartLine) {
+                safeEndLine = Math.min(tokenState.totalLines, safeStartLine + 1);
+            }
+
             // 4. Find the Token that starts at 'safeStartLine'
             const startCharIndex = tokenState.lineCharIndices[safeStartLine] || 0;
             let startTokenIndex = findTokenIndexForChar(startCharIndex);
 
-            // --- THE FIX IS HERE ---
-            // 5. Stabilize the Spacer Calculation
-            // We need to know where this token *actually* starts to set the spacer.
-            // However, if findTokenIndexForChar returns a token that ENDS exactly at our startChar,
-            // we might get a "previous line" calculation.
-            
+            /* --- FIX: Stabilize the Spacer Calculation ---
+               We need to know where this token *actually* starts to set the spacer.
+               Using the token's true start char keeps spacer height consistent and
+               avoids off-by-one line drift.
+            */
             let tokenStartChar = 0;
             if (startTokenIndex > 0) {
                  tokenStartChar = tokenState.tokenEndIndices[startTokenIndex - 1];
             }
-            
+
             const actualTokenStartLine = getLineForCharIndex(tokenStartChar);
 
-            // 6. Find End Token
+            // 5. Find End Token (exclusive upper bound)
             let endTokenIndex;
             if (safeEndLine >= tokenState.totalLines) {
                  endTokenIndex = tokenState.segments.length;
             } else {
                  const endCharIndex = tokenState.lineCharIndices[safeEndLine];
-                 endTokenIndex = findTokenIndexForChar(endCharIndex);
-                 // Ensure we include the token overlapping the bottom boundary
-                 if (endTokenIndex < tokenState.segments.length) endTokenIndex++;
+                 // Use a boundary-aware search: first token whose start >= endCharIndex.
+                 // This keeps EOF behavior stable even when endCharIndex === text.length.
+                 endTokenIndex = findFirstTokenIndexAtOrAfterChar(endCharIndex);
             }
 
             // Safety clamps
             if (startTokenIndex < 0) startTokenIndex = 0;
+            if (endTokenIndex < startTokenIndex) endTokenIndex = startTokenIndex;
             if (endTokenIndex > tokenState.segments.length) endTokenIndex = tokenState.segments.length;
 
-            // 7. Calculate Spacers
+            // 6. Calculate Spacers
             // The top spacer must represent the height of the lines strictly BEFORE the first rendered token.
             const topSpacerHeight = actualTokenStartLine * LINE_HEIGHT_PX;
             
@@ -859,11 +929,11 @@
             if (els.tokenTopSpacer) els.tokenTopSpacer.style.height = topSpacerHeight + 'px';
             if (els.tokenBottomSpacer) els.tokenBottomSpacer.style.height = bottomSpacerHeight + 'px';
 
-            // 8. Render
+            // 7. Render
             const visibleSegments = tokenState.segments.slice(startTokenIndex, endTokenIndex);
             renderVisualizer(visibleSegments, startTokenIndex);
 
-            // 9. Sync Scroll Position (Driver Logic)
+            // 8. Sync Scroll Position (Driver Logic)
             if (activePane === 'left' && Math.abs(els.visualizer.scrollTop - scrollTop) > 1) {
                 els.visualizer.scrollTop = scrollTop;
             }
@@ -894,7 +964,11 @@
             if (text.length === 0) {
                 updateTokenStats(0);
                 rebuildTokenState("", []);
-                els.tokenInner.innerHTML = '';
+                if (els.tokenInner) {
+                    els.tokenInner.innerHTML = '';
+                }
+                if (els.tokenTopSpacer) els.tokenTopSpacer.style.height = '0px';
+                if (els.tokenBottomSpacer) els.tokenBottomSpacer.style.height = '0px';
                 setSyncState('synced');
                 return;
             }
