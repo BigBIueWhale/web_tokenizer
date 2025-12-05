@@ -1,0 +1,1028 @@
+Tab this:
+<!DOCTYPE html>
+<!-- 
+    https://chatgpt.com/share/69319675-e4e8-800a-bb08-8822bf8a40d1
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>High-Performance Offline Tokenizer</title>
+    <style>
+        :root {
+            --bg-color: #f3f4f6;
+            --text-color: #1f2937;
+            --border-color: #e5e7eb;
+            --accent-color: #3b82f6;
+            --accent-hover: #2563eb;
+            --danger-color: #ef4444;
+            --success-color: #10b981;
+            --mono-font: 'Menlo', 'Consolas', 'Monaco', 'Liberation Mono', 'Lucida Console', monospace;
+            --sans-font: 'Inter', system-ui, -apple-system, sans-serif;
+            --card-bg: #ffffff;
+            --disabled-color: #9ca3af;
+            
+            /* --- ADDED: Strict Line Height for Sync --- */
+            --strict-line-height: 24px;
+        }
+
+        * { box-sizing: border-box; }
+
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            font-family: var(--sans-font);
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            overflow: hidden; /* App handles scrolling internally */
+        }
+
+        /* --- LOAD SCREEN --- */
+        #load-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(5px);
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            transition: opacity 0.3s ease;
+        }
+
+        .load-card {
+            background: white;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            text-align: center;
+            max-width: 500px;
+            width: 90%;
+        }
+
+        #drop-zone {
+            border: 2px dashed #cbd5e1;
+            border-radius: 12px;
+            padding: 40px 20px;
+            background-color: #f8fafc;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            margin: 20px 0;
+        }
+
+        #drop-zone:hover, #drop-zone.drag-active {
+            border-color: var(--accent-color);
+            background-color: #eff6ff;
+        }
+
+        /* --- MAIN LAYOUT --- */
+        #app-container {
+            display: none;
+            height: 100vh;
+            width: 100vw;
+            flex-direction: column;
+            padding: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+            gap: 20px;
+        }
+
+        /* --- HEADER SECTION (Stats & Cards) --- */
+        #header-grid {
+            display: grid;
+            grid-template-columns: 250px 1fr;
+            gap: 20px;
+            flex-shrink: 0;
+        }
+
+        /* Total Tokens Card & Control Area */
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between; /* Space between number and button */
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            position: relative;
+            overflow: hidden;
+            gap: 12px; 
+        }
+
+        .stat-content {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .stat-value {
+            font-size: 2.2rem;
+            font-weight: 700;
+            color: #111827;
+            line-height: 1;
+        }
+
+        /* Action Button */
+        #btn-compute {
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 8px;
+            background-color: var(--accent-color);
+            color: white;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: background-color 0.2s, opacity 0.2s;
+            text-align: center;
+            /* RIGHT pane is now fully virtual; hide the old manual button to reclaim vertical space */
+            display: none;
+        }
+
+        #btn-compute:hover:not(:disabled) {
+            background-color: var(--accent-hover);
+        }
+
+        #btn-compute:disabled {
+            background-color: var(--bg-color);
+            color: var(--disabled-color);
+            cursor: not-allowed;
+            border: 1px solid var(--border-color);
+        }
+
+        /* Loading Spinner inside Stats */
+        .spinner {
+            width: 16px; height: 16px;
+            border: 2px solid #e5e7eb;
+            border-top-color: var(--accent-color);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            position: absolute;
+            top: 20px; right: 20px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .spinner.active { opacity: 1; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Providers Vertical Stack */
+        .providers-stack {
+            display: flex;
+            flex-direction: row; /* Place first percent bar to the left of the second */
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .provider-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 12px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            position: relative;
+            overflow: hidden;
+            flex: 1 1 0;
+            min-width: 0;
+        }
+
+        .provider-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+
+        .provider-meta { display: flex; flex-direction: column; overflow: hidden; }
+        .provider-url { font-size: 0.75rem; color: var(--accent-color); font-family: var(--mono-font); margin-bottom: 2px; text-decoration: none; }
+        .provider-model { font-size: 0.9rem; font-weight: 600; color: #374151; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+        .provider-stats { text-align: right; min-width: 80px; }
+        .usage-percent { font-size: 1rem; font-weight: 700; color: #374151; }
+        .usage-percent.over-limit { color: var(--danger-color); }
+        .usage-max { font-size: 0.7rem; color: #9ca3af; }
+
+        .progress-bar {
+            height: 6px;
+            background: #f3f4f6;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: var(--accent-color);
+            width: 0%;
+            transition: width 0.3s ease, background-color 0.3s ease;
+        }
+        .progress-fill.danger { background: var(--danger-color); }
+
+        /* --- EDITOR SPLIT PANE --- */
+        #editor-container {
+            flex-grow: 1;
+            display: grid;
+            /* STRICT 50/50 split */
+            grid-template-columns: 1fr 1fr; 
+            gap: 0; /* Connected look */
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            
+            /* --- CHANGED: SCROLLABLE CHILDREN --- */
+            overflow: hidden; /* Parent does NOT scroll */
+            align-items: start; /* Ensure content starts at top */
+        }
+
+        .pane-header {
+            background: #f9fafb;
+            border-bottom: 1px solid var(--border-color);
+            padding: 8px 16px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            
+            /* Sticky Header */
+            /* Note: Since parent overflow is hidden, sticky inside flex children works if configured right, 
+               but here we are scrolling the .pane-content BELOW the header. 
+               The header sits in .left-pane which is flex column. */
+            z-index: 10;
+        }
+
+        .pane-content {
+            padding: 20px;
+            font-family: var(--mono-font);
+            font-size: 14px;
+            
+            /* --- CHANGED: Strict Line Height & NO WRAP --- */
+            line-height: var(--strict-line-height); /* 24px fixed */
+            white-space: pre;      /* Disable Wrapping */
+            overflow: auto;        /* Enable Both Scrolls on the PANE */
+            
+            /* --- CHANGED: Remove Wrapping Logic --- */
+            overflow-wrap: normal;
+            word-break: normal;
+            
+            width: 100%;
+            /* Height 100% of the remaining space in the flex column (header takes some) */
+            flex-grow: 1; 
+            height: 0; /* Force flex child to respect container height for scrolling */
+            will-change: scroll-position;
+        }
+
+        /* --- FIX #1: Normalize Text Rendering --- 
+           Force the textarea and the div to calculate width and spacing identically 
+        */
+        #text-input, #token-visualizer, .t-token {
+            line-height: 24px !important;
+            font-size: 16px; /* Ensure font fits within line-height */
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
+
+        /* Input specific */
+        .left-pane {
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            min-width: 0; /* Critical for CSS Grid to respect 50% width with long content */
+            height: 100%; /* Fill grid cell */
+            overflow: hidden; /* Contain inner scroll */
+        }
+        #text-input {
+            border: none;
+            resize: none;
+            outline: none;
+            color: #1f2937;
+        }
+        #text-input::placeholder { color: #d1d5db; }
+
+        /* Visualizer specific */
+        .right-pane {
+            display: flex;
+            flex-direction: column;
+            background-color: #fff;
+            min-width: 0; /* Critical for CSS Grid to respect 50% width with long content */
+            height: 100%; /* Fill grid cell */
+            overflow: hidden; /* Contain inner scroll */
+            
+            /* --- FIX #2: Equalize Pixel Debt --- */
+            border-left: 1px solid transparent; 
+        }
+
+        #token-visualizer {
+            cursor: default;
+            transition: opacity 0.2s ease;
+        }
+        #token-visualizer.stale {
+            opacity: 0.4;
+            filter: grayscale(100%);
+        }
+
+        /* Virtual token layout scaffolding for RIGHT pane */
+        #token-top-spacer,
+        #token-bottom-spacer {
+            height: 0;
+            pointer-events: none;
+        }
+
+        #token-visible-inner {
+            display: inline;
+        }
+
+        /* Token Colors */
+        .t-token {
+            border-radius: 3px;
+            padding: 1px 0;
+            display: inline; /* Ensure it flows like text */
+            box-decoration-break: clone;
+            -webkit-box-decoration-break: clone;
+
+            /* --- FIX #3: Kill Token Margins --- */
+            margin: 0; 
+            box-shadow: 0 0 0 1px #ffffff; /* Simulates a 1px white gap visually */
+        }
+        .c0 { background-color: #dbeafe; color: #1e40af; } /* Blue */
+        .c1 { background-color: #dcfce7; color: #166534; } /* Green */
+        .c2 { background-color: #f3e8ff; color: #6b21a8; } /* Purple */
+        .c3 { background-color: #ffedd5; color: #9a3412; } /* Orange */
+        .c4 { background-color: #fce7f3; color: #9d174d; } /* Pink */
+        .c5 { background-color: #ccfbf1; color: #115e59; } /* Teal */
+
+        /* Sync Status Dot */
+        .sync-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background-color: #d1d5db;
+        }
+        .sync-dot.synced { background-color: var(--success-color); box-shadow: 0 0 4px var(--success-color); }
+        .sync-dot.working { background-color: #fbbf24; animation: pulse 1s infinite; }
+
+        @keyframes pulse { 0% { opacity: 0.5; } 50% { opacity: 1; } 100% { opacity: 0.5; } }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 5px; border: 2px solid #fff; }
+        ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+    </style>
+</head>
+<body>
+
+    <div id="load-overlay">
+        <div class="load-card">
+            <h2 style="margin-top:0; color:#111827;">Tokenizer Setup</h2>
+            <p style="color:#6b7280; margin-bottom: 20px;">Secure, Offline, High-Performance</p>
+            
+            <div id="drop-zone">
+                <div style="font-size: 40px; margin-bottom: 10px;">📄</div>
+                <div style="font-weight: 500; color: #374151;">Drop 'o200k_base.json' here</div>
+                <div style="font-size: 0.85rem; color: #9ca3af; margin-top: 5px;">or click to browse</div>
+                <input type="file" id="json-upload" accept=".json" style="display:none;">
+            </div>
+            
+            <p id="error-msg" style="color: var(--danger-color); font-size: 0.9rem; min-height: 20px;"></p>
+            
+            <div style="font-size: 0.75rem; color: #9ca3af; margin-top: 20px; border-top: 1px solid #eee; padding-top: 10px;">
+                Required: <code style="background:#f3f4f6; padding: 2px 4px; border-radius: 4px;">o200k_base.json</code>
+            </div>
+        </div>
+    </div>
+
+    <div id="app-container">
+        
+        <div id="header-grid">
+            <div class="stat-card">
+                <div class="stat-content">
+                    <span class="stat-label">Total Tokens</span>
+                    <span class="stat-value" id="total-tokens">0</span>
+                </div>
+                <button id="btn-compute" disabled>Update View</button>
+                <div class="spinner" id="main-spinner"></div>
+            </div>
+
+            <div class="providers-stack" id="providers-container">
+            </div>
+        </div>
+
+        <div id="editor-container">
+            <div class="left-pane">
+                <div class="pane-header">
+                    <span>Raw Input</span>
+                </div>
+                <textarea id="text-input" class="pane-content" wrap="off" placeholder="Type or paste..." spellcheck="false" dir="auto"></textarea>
+            </div>
+
+            <div class="right-pane">
+                <div class="pane-header">
+                    <span>Token View</span>
+                    <div class="sync-dot" id="sync-status" title="Sync Status"></div>
+                </div>
+                <div id="token-visualizer" class="pane-content" dir="auto"></div>
+            </div>
+        </div>
+    </div>
+
+    <script id="worker-script" type="javascript/worker">
+        // --- WORKER LOGIC ---
+        const DOC_URL = "https://tiktoken.pages.dev/js/o200k_base.json";
+
+        function assert(condition, message) {
+            if (!condition) throw new Error(message);
+        }
+
+        // --- BPE Logic Helpers ---
+        function bytePairMerge(piece, ranks) {
+            let parts = Array.from({ length: piece.length }, (_, i) => ({ start: i, end: i + 1 }));
+            while (parts.length > 1) {
+                let minRank = null;
+                let minIndex = -1;
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const slice = piece.slice(parts[i].start, parts[i+1].end);
+                    const key = slice.join(",");
+                    const rank = ranks.get(key);
+                    if (rank === undefined) continue;
+                    if (minRank === null || rank < minRank) {
+                        minRank = rank;
+                        minIndex = i;
+                    }
+                }
+                if (minRank !== null) {
+                    const i = minIndex;
+                    parts[i] = { start: parts[i].start, end: parts[i+1].end };
+                    parts.splice(i + 1, 1);
+                } else {
+                    break;
+                }
+            }
+            return parts;
+        }
+
+        // Returns Array of Uint8Arrays (the split segments)
+        function bytePairSplit(piece, ranks) {
+            if (piece.length === 1) return [piece];
+            const merged = bytePairMerge(piece, ranks);
+            
+            // Map the merge parts back to the actual byte slices
+            return merged.map(p => piece.slice(p.start, p.end));
+        }
+
+        class Tiktoken {
+            constructor(jsonData) {
+                assert(typeof jsonData === 'object', "Invalid JSON");
+                this.patStr = jsonData.pat_str;
+                this.specialTokens = jsonData.special_tokens;
+                this.rankMap = new Map();
+                this.textEncoder = new TextEncoder();
+                this.textDecoder = new TextDecoder("utf-8");
+                this.loadRanks(jsonData.bpe_ranks);
+            }
+
+            loadRanks(bpeRanksStr) {
+                const lines = bpeRanksStr.split('\n').filter(line => line.length > 0);
+                lines.forEach(line => {
+                    const parts = line.split(" ");
+                    if (parts[0] === "!") {
+                        const startRank = parseInt(parts[1], 10);
+                        for (let i = 2; i < parts.length; i++) {
+                            const tokenB64 = parts[i];
+                            const rank = startRank + (i - 2);
+                            const binaryString = atob(tokenB64);
+                            const bytes = new Uint8Array(binaryString.length);
+                            for (let b = 0; b < binaryString.length; b++) bytes[b] = binaryString.charCodeAt(b);
+                            this.rankMap.set(bytes.join(","), rank);
+                        }
+                    } else {
+                        const [tokenB64, rankStr] = parts;
+                        if(rankStr) {
+                            const rank = parseInt(rankStr, 10);
+                            const binaryString = atob(tokenB64);
+                            const bytes = new Uint8Array(binaryString.length);
+                            for (let b = 0; b < binaryString.length; b++) bytes[b] = binaryString.charCodeAt(b);
+                            this.rankMap.set(bytes.join(","), rank);
+                        }
+                    }
+                });
+            }
+
+            // Returns { count: number, segments: string[] }
+            encodeAndSegment(text) {
+                const regex = new RegExp(this.patStr, "ug");
+                const specialRegex = new RegExp(Object.keys(this.specialTokens).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join("|"), "g");
+                
+                let count = 0;
+                const segments = [];
+                let start = 0;
+
+                while (true) {
+                    let nextSpecial = null;
+                    specialRegex.lastIndex = start;
+                    nextSpecial = specialRegex.exec(text);
+                    
+                    const end = nextSpecial ? nextSpecial.index : text.length;
+                    const chunk = text.substring(start, end);
+
+                    let match;
+                    const chunkRegex = new RegExp(this.patStr, "ug");
+                    
+                    while ((match = chunkRegex.exec(chunk)) !== null) {
+                        const pieceBytes = this.textEncoder.encode(match[0]);
+                        const token = this.rankMap.get(pieceBytes.join(","));
+                        
+                        if (token !== undefined) {
+                            count++;
+                            segments.push(match[0]);
+                        } else {
+                            // Need to perform BPE split and decode back to strings
+                            const splitBytes = bytePairSplit(pieceBytes, this.rankMap);
+                            splitBytes.forEach(sb => {
+                                count++;
+                                segments.push(this.textDecoder.decode(sb));
+                            });
+                        }
+                    }
+
+                    if (!nextSpecial) break;
+                    count++;
+                    segments.push(nextSpecial[0]); // Special token string
+                    start = nextSpecial.index + nextSpecial[0].length;
+                }
+                return { count, segments };
+            }
+        }
+
+        let tokenizer = null;
+
+        self.onmessage = function(e) {
+            const msg = e.data;
+            if (msg.type === 'init') {
+                try {
+                    tokenizer = new Tiktoken(msg.data);
+                    self.postMessage({ type: 'ready' });
+                } catch (err) {
+                    self.postMessage({ type: 'error', message: err.message });
+                }
+            } else if (msg.type === 'compute') {
+                if (!tokenizer) return;
+                try {
+                    const result = tokenizer.encodeAndSegment(msg.text);
+                    self.postMessage({ 
+                        type: 'result', 
+                        count: result.count,
+                        segments: result.segments, 
+                        requestId: msg.requestId 
+                    });
+                } catch (err) {
+                    self.postMessage({ type: 'error', message: err.message });
+                }
+            }
+        };
+    </script>
+
+    <script>
+        // --- CONFIGURATION ---
+        const CONFIG = {
+            services: [
+                { 
+                    url: "https://chat.example.com/", 
+                    modelName: "GPT-OSS 120B Low Thinking",
+                    limit: 108000 
+                },
+                { 
+                    url: "https://chat.bad-ai.com/", 
+                    modelName: "GPT-OSS 120B No Thinking",
+                    limit: 10000 
+                }
+            ],
+            debounceTime: 1500
+        };
+    
+        // --- EMBEDDED MODE CONFIGURATION ---
+        // To use embedded mode, replace 'null' below with the Base64 string of the file.
+        // The Base64 should represent the binary content of the UTF-8 JSON file.
+        // Example: const PRELOADED_BASE64_JSON = "eyJwYXRfc3RyIjogIig/aS..." 
+        const PRELOADED_BASE64_JSON = null; 
+        
+        // STRICT LINE HEIGHT - Must match CSS
+        const LINE_HEIGHT_PX = 24;
+    
+        // --- DOM ELEMENTS ---
+        const els = {
+            dropZone: document.getElementById('drop-zone'),
+            fileInput: document.getElementById('json-upload'),
+            loadOverlay: document.getElementById('load-overlay'),
+            appContainer: document.getElementById('app-container'),
+            errorMsg: document.getElementById('error-msg'),
+            totalTokens: document.getElementById('total-tokens'),
+            spinner: document.getElementById('main-spinner'),
+            providersContainer: document.getElementById('providers-container'),
+            input: document.getElementById('text-input'),
+            visualizer: document.getElementById('token-visualizer'),
+            syncDot: document.getElementById('sync-status'),
+            editorContainer: document.getElementById('editor-container'),
+            computeBtn: document.getElementById('btn-compute')
+        };
+    
+        els.tokenTopSpacer = null;
+        els.tokenBottomSpacer = null;
+        els.tokenInner = null;
+    
+        // --- STATE ---
+        let computationTimeout = null;
+        let currentRequestId = 0;
+        let pendingSegments = null;
+        let virtualUpdateTimeout = null;
+        const VIRTUAL_DEBOUNCE_MS = 10; // Fast response
+    
+        // NEW: Active driver tracking to prevent scroll loops
+        let activePane = null;
+    
+        const tokenState = {
+            segments: [],
+            lineCharIndices: [], // Maps Line Number -> First Char Index of that line
+            tokenEndIndices: null, // Maps Token Index -> End Char Index
+            totalLines: 0,
+            textSnapshot: "",
+            isSynced: false
+        };
+        
+        const blob = new Blob([document.getElementById('worker-script').textContent], { type: "text/javascript" });
+        const worker = new Worker(window.URL.createObjectURL(blob));
+    
+        // --- INITIALIZATION ---
+        function initUI() {
+            els.providersContainer.innerHTML = '';
+            CONFIG.services.forEach((svc, i) => {
+                const div = document.createElement('div');
+                div.className = 'provider-card';
+                div.innerHTML = `
+                    <div class="provider-header">
+                        <div class="provider-meta">
+                            <a href="${svc.url}" class="provider-url" target="_blank">${svc.url}</a>
+                            <span class="provider-model" title="${svc.modelName}">${svc.modelName}</span>
+                        </div>
+                        <div class="provider-stats">
+                            <div class="usage-percent" id="p-percent-${i}">0.00%</div>
+                            <div class="usage-max">Max: ${(svc.limit / 1000).toFixed(0)}k</div>
+                        </div>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="p-fill-${i}"></div>
+                    </div>
+                `;
+                els.providersContainer.appendChild(div);
+            });
+        }
+    
+        function initVirtualizerDom() {
+            if (els.tokenInner) return;
+            const top = document.createElement('div');
+            top.id = 'token-top-spacer';
+            const inner = document.createElement('div');
+            inner.id = 'token-visible-inner';
+            const bottom = document.createElement('div');
+            bottom.id = 'token-bottom-spacer';
+    
+            els.visualizer.innerHTML = '';
+            els.visualizer.appendChild(top);
+            els.visualizer.appendChild(inner);
+            els.visualizer.appendChild(bottom);
+    
+            els.tokenTopSpacer = top;
+            els.tokenBottomSpacer = bottom;
+            els.tokenInner = inner;
+        }
+    
+        // --- DATA HANDLING ---
+        function loadTokenizer(json) {
+            worker.postMessage({ type: 'init', data: json });
+        }
+    
+        function handleFile(file) {
+            if (!file) return;
+            els.errorMsg.innerText = "";
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    loadTokenizer(JSON.parse(e.target.result));
+                } catch (err) {
+                    els.errorMsg.innerText = "Error: " + err.message;
+                }
+            };
+            reader.readAsText(file);
+        }
+    
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+            els.dropZone.addEventListener(evt, (e) => { e.preventDefault(); e.stopPropagation(); });
+        });
+        els.dropZone.addEventListener('drop', (e) => handleFile(e.dataTransfer.files[0]));
+        els.dropZone.addEventListener('click', () => els.fileInput.click());
+        els.fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+    
+        // --- STATE BUILDING ---
+        function rebuildTokenState(text, segments) {
+            tokenState.segments = Array.isArray(segments) ? segments.slice() : [];
+            tokenState.textSnapshot = text;
+            
+            // 1. Map Line -> Start Char
+            tokenState.lineCharIndices = [0];
+            for (let i = 0; i < text.length; i++) {
+                if (text[i] === '\n') {
+                    tokenState.lineCharIndices.push(i + 1);
+                }
+            }
+            tokenState.totalLines = tokenState.lineCharIndices.length;
+    
+            // 2. Map Token -> End Char
+            tokenState.tokenEndIndices = new Uint32Array(tokenState.segments.length);
+            let runningLength = 0;
+            for (let i = 0; i < tokenState.segments.length; i++) {
+                runningLength += tokenState.segments[i].length;
+                tokenState.tokenEndIndices[i] = runningLength;
+            }
+        }
+    
+        // --- HELPER: CHAR -> LINE MAPPING ---
+        // This allows us to find exactly which line a token starts on, even if it's mid-file
+        function getLineForCharIndex(charIdx) {
+            let low = 0, high = tokenState.lineCharIndices.length - 1;
+            while (low <= high) {
+                let mid = (low + high) >>> 1;
+                if (tokenState.lineCharIndices[mid] === charIdx) return mid;
+                if (tokenState.lineCharIndices[mid] < charIdx) low = mid + 1;
+                else high = mid - 1;
+            }
+            return Math.max(0, high);
+        }
+    
+        function findTokenIndexForChar(charIndex) {
+            let left = 0;
+            let right = tokenState.tokenEndIndices.length - 1;
+            while (left <= right) {
+                const mid = (left + right) >>> 1;
+                const start = mid === 0 ? 0 : tokenState.tokenEndIndices[mid - 1];
+                const end = tokenState.tokenEndIndices[mid];
+                
+                if (charIndex >= start && charIndex < end) return mid;
+                else if (charIndex < start) right = mid - 1;
+                else left = mid + 1;
+            }
+            return 0;
+        }
+    
+        // --- VIRTUALIZATION LOGIC ---
+        function scheduleVirtualUpdate() {
+            if (!tokenState.isSynced || !els.tokenInner) return;
+            if (virtualUpdateTimeout) clearTimeout(virtualUpdateTimeout);
+            virtualUpdateTimeout = setTimeout(applyVirtualViewport, VIRTUAL_DEBOUNCE_MS);
+        }
+    
+        function applyVirtualViewport() {
+            if (!tokenState.segments.length) {
+                renderVisualizer([], 0);
+                return;
+            }
+
+            // 1. Where are we in the viewport?
+            const scrollTop = els.input.scrollTop;
+            const viewportHeight = els.input.clientHeight;
+            
+            // 2. Determine target lines
+            // Use Math.floor/ceil to map pixels to logical lines
+            let startLine = Math.floor(scrollTop / LINE_HEIGHT_PX);
+            let endLine = Math.ceil((scrollTop + viewportHeight) / LINE_HEIGHT_PX);
+
+            // 3. Overscan (Render extra lines to prevent gray flicker)
+            const OVERSCAN = 5; 
+            let safeStartLine = Math.max(0, startLine - OVERSCAN);
+            let safeEndLine = Math.min(tokenState.totalLines, endLine + OVERSCAN);
+
+            // 4. Find the Token that starts at 'safeStartLine'
+            const startCharIndex = tokenState.lineCharIndices[safeStartLine] || 0;
+            let startTokenIndex = findTokenIndexForChar(startCharIndex);
+
+            // --- THE FIX IS HERE ---
+            // 5. Stabilize the Spacer Calculation
+            // We need to know where this token *actually* starts to set the spacer.
+            // However, if findTokenIndexForChar returns a token that ENDS exactly at our startChar,
+            // we might get a "previous line" calculation.
+            
+            let tokenStartChar = 0;
+            if (startTokenIndex > 0) {
+                 tokenStartChar = tokenState.tokenEndIndices[startTokenIndex - 1];
+            }
+            
+            const actualTokenStartLine = getLineForCharIndex(tokenStartChar);
+
+            // 6. Find End Token
+            let endTokenIndex;
+            if (safeEndLine >= tokenState.totalLines) {
+                 endTokenIndex = tokenState.segments.length;
+            } else {
+                 const endCharIndex = tokenState.lineCharIndices[safeEndLine];
+                 endTokenIndex = findTokenIndexForChar(endCharIndex);
+                 // Ensure we include the token overlapping the bottom boundary
+                 if (endTokenIndex < tokenState.segments.length) endTokenIndex++;
+            }
+
+            // Safety clamps
+            if (startTokenIndex < 0) startTokenIndex = 0;
+            if (endTokenIndex > tokenState.segments.length) endTokenIndex = tokenState.segments.length;
+
+            // 7. Calculate Spacers
+            // The top spacer must represent the height of the lines strictly BEFORE the first rendered token.
+            const topSpacerHeight = actualTokenStartLine * LINE_HEIGHT_PX;
+            
+            // The bottom spacer fills the rest of the document height
+            // Calculating based on remaining lines is safer than pixel subtraction to avoid negative gaps
+            const bottomSpacerHeight = Math.max(0, (tokenState.totalLines - safeEndLine) * LINE_HEIGHT_PX);
+
+            // Apply
+            if (els.tokenTopSpacer) els.tokenTopSpacer.style.height = topSpacerHeight + 'px';
+            if (els.tokenBottomSpacer) els.tokenBottomSpacer.style.height = bottomSpacerHeight + 'px';
+
+            // 8. Render
+            const visibleSegments = tokenState.segments.slice(startTokenIndex, endTokenIndex);
+            renderVisualizer(visibleSegments, startTokenIndex);
+
+            // 9. Sync Scroll Position (Driver Logic)
+            if (activePane === 'left' && Math.abs(els.visualizer.scrollTop - scrollTop) > 1) {
+                els.visualizer.scrollTop = scrollTop;
+            }
+        }
+    
+        function renderVisualizer(segments, offsetIndex = 0) {
+            const fragment = document.createDocumentFragment();
+            segments.forEach((seg, index) => {
+                const span = document.createElement('span');
+                span.textContent = seg;
+                const globalIndex = offsetIndex + index;
+                span.className = `t-token c${globalIndex % 6}`;
+                span.title = `Token ID: ${globalIndex}`;
+                fragment.appendChild(span);
+            });
+            
+            const target = els.tokenInner;
+            target.innerHTML = '';
+            target.appendChild(fragment);
+            pendingSegments = null;
+        }
+    
+        // --- EVENTS & HANDLERS ---
+    
+        function triggerComputation() {
+            const text = els.input.value;
+            currentRequestId++;
+            if (text.length === 0) {
+                updateTokenStats(0);
+                rebuildTokenState("", []);
+                els.tokenInner.innerHTML = '';
+                setSyncState('synced');
+                return;
+            }
+            setSyncState('working');
+            worker.postMessage({ type: 'compute', text: text, requestId: currentRequestId });
+        }
+    
+        els.input.addEventListener('input', () => {
+            els.spinner.classList.add('active');
+            els.visualizer.classList.add('stale');
+            els.computeBtn.disabled = true; 
+            els.computeBtn.innerText = "Computing...";
+            setSyncState('working');
+            if (computationTimeout) clearTimeout(computationTimeout);
+            computationTimeout = setTimeout(triggerComputation, CONFIG.debounceTime);
+        });
+    
+        els.computeBtn.addEventListener('click', () => {
+            if (pendingSegments) {
+                rebuildTokenState(els.input.value || "", pendingSegments);
+                setSyncState('synced');
+            }
+        });
+    
+        function setSyncState(state) {
+            if(state === 'working') {
+                els.syncDot.className = 'sync-dot working';
+                tokenState.isSynced = false;
+            } else if (state === 'ready') {
+                els.syncDot.className = 'sync-dot working';
+                els.spinner.classList.remove('active');
+                els.computeBtn.disabled = false;
+                els.computeBtn.innerText = "Update View";
+            } else {
+                els.syncDot.className = 'sync-dot synced';
+                els.spinner.classList.remove('active');
+                els.visualizer.classList.remove('stale');
+                els.computeBtn.disabled = true;
+                els.computeBtn.innerText = "Up to Date";
+                tokenState.isSynced = true;
+                scheduleVirtualUpdate();
+            }
+        }
+    
+        function updateTokenStats(count) {
+            els.totalTokens.innerText = count.toLocaleString();
+            CONFIG.services.forEach((svc, i) => {
+                const pctEl = document.getElementById(`p-percent-${i}`);
+                const fillEl = document.getElementById(`p-fill-${i}`);
+                const percent = (count / svc.limit) * 100;
+                pctEl.innerText = Math.min(percent, 999).toFixed(2) + "%";
+                fillEl.style.width = Math.min(percent, 100) + "%";
+                if (count > svc.limit) {
+                    pctEl.classList.add('over-limit');
+                    fillEl.classList.add('danger');
+                } else {
+                    pctEl.classList.remove('over-limit');
+                    fillEl.classList.remove('danger');
+                }
+            });
+        }
+    
+        // Worker Message Handler
+        worker.onmessage = (e) => {
+            const msg = e.data;
+            if (msg.type === 'ready') {
+                els.loadOverlay.style.opacity = '0';
+                setTimeout(() => {
+                    els.loadOverlay.style.display = 'none';
+                    els.appContainer.style.display = 'flex';
+                    initUI();
+                    initVirtualizerDom();
+                    scheduleVirtualUpdate();
+                }, 300);
+            } else if (msg.type === 'result') {
+                if (msg.requestId === currentRequestId) {
+                    updateTokenStats(msg.count);
+                    pendingSegments = msg.segments;
+                    rebuildTokenState(els.input.value || "", msg.segments);
+                    setSyncState('synced');
+                }
+            } else if (msg.type === 'error') {
+                alert(msg.message);
+                setSyncState('synced');
+            }
+        };
+    
+        // --- STARTUP & SCROLL SYNC ---
+        window.addEventListener('DOMContentLoaded', () => {
+            if(PRELOADED_BASE64_JSON) {
+                try {
+                    const binaryString = atob(PRELOADED_BASE64_JSON);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+                    const jsonString = new TextDecoder('utf-8').decode(bytes);
+                    loadTokenizer(JSON.parse(jsonString));
+                } catch (e) {
+                    els.errorMsg.innerText = "Embedded data corruption: " + e.message;
+                }
+            }
+    
+            initUI();
+            initVirtualizerDom();
+            window.addEventListener('resize', scheduleVirtualUpdate);
+    
+            // --- MOUSE TRACKING (Driver Pattern) ---
+            // Determines which pane controls the synchronization
+            els.input.addEventListener('mouseenter', () => { activePane = 'left'; });
+            els.visualizer.addEventListener('mouseenter', () => { activePane = 'right'; });
+            document.body.addEventListener('mouseleave', () => { activePane = null; });
+    
+            // Left Pane Scroll (Driver)
+            els.input.addEventListener('scroll', () => {
+                scheduleVirtualUpdate(); // Always virtualize
+                if (activePane === 'left') {
+                    els.visualizer.scrollTop = els.input.scrollTop;
+                }
+            });
+    
+            // Right Pane Scroll (Driver)
+            els.visualizer.addEventListener('scroll', () => {
+                if (activePane === 'right') {
+                    els.input.scrollTop = els.visualizer.scrollTop;
+                    scheduleVirtualUpdate(); // Update visualization as we scroll right pane too
+                }
+            });
+        });
+    </script>
+</body>
+</html>
