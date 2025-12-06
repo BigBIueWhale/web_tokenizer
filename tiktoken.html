@@ -1257,7 +1257,11 @@
             const tokenIndex = span.dataset.tokenIndex ?? "?";
             const tokenId = span.dataset.tokenId;
             const rawText = span.textContent || "";
-            const displayText = rawText.replace(/\s/g, " ");
+            
+            // Old: const displayText = rawText.replace(/\s/g, " ");
+            // New: Use JSON stringify to escape characters, then strip the surrounding quotes
+            const displayText = JSON.stringify(rawText).slice(1, -1);
+
             const truncated = displayText.length > 40 ? displayText.slice(0, 37) + "…" : displayText;
 
             const label = tokenId !== undefined
