@@ -481,6 +481,25 @@
         ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 5px; border: 2px solid #fff; }
         ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
 
+        /* Custom token tooltip (we don't rely on native title tooltips) */
+        .token-tooltip {
+            position: fixed;
+            background: rgba(15, 23, 42, 0.96);
+            color: #f9fafb;
+            font-family: var(--mono-font);
+            font-size: 12px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            pointer-events: none;
+            z-index: 2000;
+            white-space: nowrap;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.15);
+            transform: translate3d(0,0,0);
+        }
+        .token-tooltip.hidden {
+            display: none;
+        }
+
     </style>
 </head>
 <body>
@@ -554,6 +573,9 @@
         </div>
     </div>
 
+    <!-- Custom tooltip for tokens (we don't rely on native title tooltips so this works in desktop browsers reliably) -->
+    <div id="token-tooltip" class="token-tooltip hidden"></div>
+
     <script id="worker-script" type="javascript/worker">
         // --- WORKER LOGIC ---
         const DOC_URL = "https://tiktoken.pages.dev/js/o200k_base.json";
@@ -600,85 +622,107 @@
 
         class Tiktoken {
             constructor(jsonData) {
-                assert(typeof jsonData === 'object', "Invalid JSON");
+                assert(typeof jsonData === 'object' && jsonData !== null, "Invalid JSON: expected top-level object for encoding data");
                 this.patStr = jsonData.pat_str;
-                this.specialTokens = jsonData.special_tokens;
+                this.specialTokens = jsonData.special_tokens || {};
                 this.rankMap = new Map();
                 this.textEncoder = new TextEncoder();
                 this.textDecoder = new TextDecoder("utf-8");
+                // Compile the main regex once; we reuse it per encode call.
+                this.pieceRegex = new RegExp(this.patStr, "ug");
                 this.loadRanks(jsonData.bpe_ranks);
             }
 
             loadRanks(bpeRanksStr) {
-                const lines = bpeRanksStr.split('\n').filter(line => line.length > 0);
-                lines.forEach(line => {
-                    const parts = line.split(" ");
-                    if (parts[0] === "!") {
-                        const startRank = parseInt(parts[1], 10);
-                        for (let i = 2; i < parts.length; i++) {
-                            const tokenB64 = parts[i];
-                            const rank = startRank + (i - 2);
-                            const binaryString = atob(tokenB64);
-                            const bytes = new Uint8Array(binaryString.length);
-                            for (let b = 0; b < binaryString.length; b++) bytes[b] = binaryString.charCodeAt(b);
-                            this.rankMap.set(bytes.join(","), rank);
-                        }
-                    } else {
-                        const [tokenB64, rankStr] = parts;
-                        if(rankStr) {
-                            const rank = parseInt(rankStr, 10);
-                            const binaryString = atob(tokenB64);
-                            const bytes = new Uint8Array(binaryString.length);
-                            for (let b = 0; b < binaryString.length; b++) bytes[b] = binaryString.charCodeAt(b);
-                            this.rankMap.set(bytes.join(","), rank);
-                        }
+                // For o200k_base.json, bpe_ranks is a single space-separated string:
+                // "! <offset> <b64> <b64> ..."
+                // We don't support any other format; anything else is a hard error with details.
+                assert(typeof bpeRanksStr === "string", "Expected bpe_ranks to be a string");
+                const parts = bpeRanksStr.split(" ").filter(Boolean);
+                assert(
+                    parts.length >= 3,
+                    `Expected bpe_ranks in format "! <offset> <b64> <b64> ...", but got too few parts. Prefix: "${bpeRanksStr.slice(0, 120)}..."`
+                );
+                const [bang, offsetStr, ...tokens] = parts;
+                assert(
+                    bang === "!",
+                    `Expected bpe_ranks to start with "!" but found "${bang}". First few tokens: "${parts.slice(0, 5).join(" ")}"`
+                );
+                const offset = Number.parseInt(offsetStr, 10);
+                assert(
+                    Number.isFinite(offset),
+                    `Expected numeric offset immediately after "!" in bpe_ranks but found "${offsetStr}".`
+                );
+
+                tokens.forEach((tokenB64, i) => {
+                    const rank = offset + i;
+                    let binaryString;
+                    try {
+                        binaryString = atob(tokenB64);
+                    } catch (e) {
+                        throw new Error(
+                            `Failed to base64-decode token #${i} ("${tokenB64}") while parsing bpe_ranks: ${e.message}`
+                        );
                     }
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let j = 0; j < binaryString.length; j++) {
+                        bytes[j] = binaryString.charCodeAt(j);
+                    }
+                    const key = bytes.join(",");
+                    if (this.rankMap.has(key)) {
+                        throw new Error(
+                            `Duplicate byte sequence in bpe_ranks for key "${key}". Expected a one-to-one mapping from byte sequence to rank.`
+                        );
+                    }
+                    this.rankMap.set(key, rank);
                 });
             }
 
-            // Returns { count: number, segments: string[] }
+            // Returns { count: number, segments: string[], tokenIds: number[] }
             encodeAndSegment(text) {
-                const regex = new RegExp(this.patStr, "ug");
-                const specialRegex = new RegExp(Object.keys(this.specialTokens).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join("|"), "g");
-                
-                let count = 0;
+                // NOTE: We deliberately ignore JSON `special_tokens` and treat those strings as plain text.
+                // This UI tokenizes a single prompt buffer, not a multi-message request/response chain format,
+                // so it is more useful to see how the raw characters are tokenized rather than treat specials as control codes.
+
                 const segments = [];
-                let start = 0;
+                const tokenIds = [];
+                let count = 0;
 
-                while (true) {
-                    let nextSpecial = null;
-                    specialRegex.lastIndex = start;
-                    nextSpecial = specialRegex.exec(text);
-                    
-                    const end = nextSpecial ? nextSpecial.index : text.length;
-                    const chunk = text.substring(start, end);
+                // Reset the regex state for this encoding run.
+                this.pieceRegex.lastIndex = 0;
 
-                    let match;
-                    const chunkRegex = new RegExp(this.patStr, "ug");
-                    
-                    while ((match = chunkRegex.exec(chunk)) !== null) {
-                        const pieceBytes = this.textEncoder.encode(match[0]);
-                        const token = this.rankMap.get(pieceBytes.join(","));
-                        
-                        if (token !== undefined) {
+                let match;
+                while ((match = this.pieceRegex.exec(text)) !== null) {
+                    const pieceStr = match[0];
+                    const pieceBytes = this.textEncoder.encode(pieceStr);
+                    const directKey = pieceBytes.join(",");
+                    const directRank = this.rankMap.get(directKey);
+
+                    if (directRank !== undefined) {
+                        // Whole piece is a single known token.
+                        segments.push(this.textDecoder.decode(pieceBytes));
+                        tokenIds.push(directRank);
+                        count++;
+                    } else {
+                        // Need to perform BPE split and map each span to a token id.
+                        const splitBytes = bytePairSplit(pieceBytes, this.rankMap);
+                        for (const sb of splitBytes) {
+                            const key = sb.join(",");
+                            const rank = this.rankMap.get(key);
+                            if (rank === undefined) {
+                                throw new Error(
+                                    `BPE split produced a byte sequence with no rank: "${key}". ` +
+                                    `This should be impossible if bpe_ranks covers all merges and single-byte tokens.`
+                                );
+                                }
+                            segments.push(this.textDecoder.decode(sb));
+                            tokenIds.push(rank);
                             count++;
-                            segments.push(match[0]);
-                        } else {
-                            // Need to perform BPE split and decode back to strings
-                            const splitBytes = bytePairSplit(pieceBytes, this.rankMap);
-                            splitBytes.forEach(sb => {
-                                count++;
-                                segments.push(this.textDecoder.decode(sb));
-                            });
                         }
                     }
-
-                    if (!nextSpecial) break;
-                    count++;
-                    segments.push(nextSpecial[0]); // Special token string
-                    start = nextSpecial.index + nextSpecial[0].length;
                 }
-                return { count, segments };
+
+                return { count, segments, tokenIds };
             }
         }
 
@@ -700,7 +744,8 @@
                     self.postMessage({ 
                         type: 'result', 
                         count: result.count,
-                        segments: result.segments, 
+                        segments: result.segments,
+                        tokenIds: result.tokenIds,
                         requestId: msg.requestId 
                     });
                 } catch (err) {
@@ -755,7 +800,8 @@
             lineNumberGutter: document.getElementById('line-number-gutter'),
             lineNumberInner: document.getElementById('line-numbers'),
             lineTopSpacer: document.getElementById('line-top-spacer'),
-            lineBottomSpacer: document.getElementById('line-bottom-spacer')
+            lineBottomSpacer: document.getElementById('line-bottom-spacer'),
+            tooltip: document.getElementById('token-tooltip')
         };
     
         els.tokenTopSpacer = null;
@@ -766,6 +812,7 @@
         let computationTimeout = null;
         let currentRequestId = 0;
         let pendingSegments = null;
+        let pendingTokenIds = null;
         let virtualUpdateTimeout = null;
         const VIRTUAL_DEBOUNCE_MS = 10; // Fast response
     
@@ -774,6 +821,7 @@
     
         const tokenState = {
             segments: [],
+            tokenIds: [],
             lineCharIndices: [], // Maps Line Number -> First Char Index of that line
             tokenStartIndices: null, // Maps Token Index -> Start Char Index
             tokenEndIndices: null,   // Maps Token Index -> End Char Index (exclusive)
@@ -947,10 +995,18 @@
         els.fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
     
         // --- STATE BUILDING ---
-        function rebuildTokenState(text, segments) {
+        function rebuildTokenState(text, segments, tokenIds) {
             tokenState.segments = Array.isArray(segments) ? segments.slice() : [];
+            tokenState.tokenIds = Array.isArray(tokenIds) ? tokenIds.slice() : [];
             tokenState.textSnapshot = text;
             tokenState.textLength = text.length;
+            
+            // Normalize length mismatch defensively (shouldn't happen, but fail-soft if it does)
+            if (tokenState.tokenIds.length && tokenState.tokenIds.length !== tokenState.segments.length) {
+                const minLen = Math.min(tokenState.segments.length, tokenState.tokenIds.length);
+                tokenState.segments.length = minLen;
+                tokenState.tokenIds.length = minLen;
+            }
             
             // 1. Map Line -> Start Char
             tokenState.lineCharIndices = [0];
@@ -1156,7 +1212,17 @@
                 span.textContent = seg;
                 const globalIndex = offsetIndex + index;
                 span.className = `t-token c${globalIndex % 6}`;
-                span.title = `Token ID: ${globalIndex}`;
+                
+                const tokenIds = tokenState.tokenIds;
+                const tokenId = (tokenIds && tokenIds.length > globalIndex)
+                    ? tokenIds[globalIndex]
+                    : undefined;
+
+                span.dataset.tokenIndex = String(globalIndex);
+                if (tokenId !== undefined) {
+                    span.dataset.tokenId = String(tokenId);
+                }
+                
                 fragment.appendChild(span);
             });
             
@@ -1166,6 +1232,57 @@
             pendingSegments = null;
         }
     
+        // --- TOKEN TOOLTIP HELPERS (custom, so it works reliably in desktop browsers) ---
+        function findTokenSpanFromEvent(e) {
+            let node = e.target;
+            while (node && node !== els.visualizer) {
+                if (node.classList && node.classList.contains('t-token')) return node;
+                node = node.parentNode;
+            }
+            return null;
+        }
+
+        function hideTooltip() {
+            if (!els.tooltip) return;
+            els.tooltip.classList.add('hidden');
+        }
+
+        function handleVisualizerMouseMove(e) {
+            if (!els.tooltip) return;
+            const span = findTokenSpanFromEvent(e);
+            if (!span) {
+                hideTooltip();
+                return;
+            }
+            const tokenIndex = span.dataset.tokenIndex ?? "?";
+            const tokenId = span.dataset.tokenId;
+            const rawText = span.textContent || "";
+            const displayText = rawText.replace(/\s/g, " ");
+            const truncated = displayText.length > 40 ? displayText.slice(0, 37) + "…" : displayText;
+
+            const label = tokenId !== undefined
+                ? `#${tokenIndex} · id=${tokenId} · "${truncated}"`
+                : `#${tokenIndex} · "${truncated}"`;
+
+            els.tooltip.textContent = label;
+            els.tooltip.classList.remove('hidden');
+
+            const offsetX = 12;
+            const offsetY = 18;
+            let x = e.clientX + offsetX;
+            let y = e.clientY + offsetY;
+
+            const rect = els.tooltip.getBoundingClientRect();
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+
+            if (x + rect.width + 8 > vw) x = vw - rect.width - 8;
+            if (y + rect.height + 8 > vh) y = vh - rect.height - 8;
+
+            els.tooltip.style.left = x + 'px';
+            els.tooltip.style.top = y + 'px';
+        }
+    
         // --- EVENTS & HANDLERS ---
     
         function triggerComputation() {
@@ -1173,7 +1290,7 @@
             currentRequestId++;
             if (text.length === 0) {
                 updateTokenStats(0);
-                rebuildTokenState("", []);
+                rebuildTokenState("", [], []);
                 if (els.tokenInner) {
                     els.tokenInner.innerHTML = '';
                 }
@@ -1200,8 +1317,8 @@
         });
     
         els.computeBtn.addEventListener('click', () => {
-            if (pendingSegments) {
-                rebuildTokenState(els.input.value || "", pendingSegments);
+            if (pendingSegments && pendingTokenIds) {
+                rebuildTokenState(els.input.value || "", pendingSegments, pendingTokenIds);
                 setSyncState('synced');
             }
         });
@@ -1261,7 +1378,8 @@
                 if (msg.requestId === currentRequestId) {
                     updateTokenStats(msg.count);
                     pendingSegments = msg.segments;
-                    rebuildTokenState(els.input.value || "", msg.segments);
+                    pendingTokenIds = msg.tokenIds || [];
+                    rebuildTokenState(els.input.value || "", msg.segments, msg.tokenIds || []);
                     setSyncState('synced');
                 }
             } else if (msg.type === 'error') {
@@ -1315,6 +1433,10 @@
                     syncLineNumberScroll();
                 }
             });
+
+            // Attach tooltip handlers so hovering over tokens in any desktop browser shows correct id/index.
+            els.visualizer.addEventListener('mousemove', handleVisualizerMouseMove);
+            els.visualizer.addEventListener('mouseleave', hideTooltip);
         });
     </script>
 </body>
