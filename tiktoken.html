@@ -18,10 +18,11 @@
             --card-bg: #ffffff;
             --disabled-color: #9ca3af;
             
-            /* --- ADDED: Strict Line Height for Sync --- */
+            /* --- Strict Line Height for Sync --- */
+            /* Essential for mapping scroll offsets between the raw textarea and the token visualizer */
             --strict-line-height: 24px;
 
-            /* --- ADDED: Line Number Gutter Width --- */
+            /* --- Line Number Gutter Width --- */
             --line-number-gutter-width: 56px;
         }
 
@@ -77,7 +78,7 @@
             background-color: #eff6ff;
         }
 
-        /* --- ADDED: Initial load hint styling --- */
+        /* --- Initial load hint styling --- */
         .load-hint {
             margin-top: 12px;
             font-size: 0.8rem;
@@ -270,7 +271,7 @@
             border-radius: 12px;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
             
-            /* --- CHANGED: SCROLLABLE CHILDREN --- */
+            /* --- SCROLLABLE CHILDREN --- */
             overflow: hidden; /* Parent does NOT scroll */
             align-items: start; /* Ensure content starts at top */
         }
@@ -300,12 +301,12 @@
             font-family: var(--mono-font);
             font-size: 14px;
             
-            /* --- CHANGED: Strict Line Height & NO WRAP --- */
+            /* --- Strict Line Height & NO WRAP --- */
             line-height: var(--strict-line-height); /* 24px fixed */
-            white-space: pre;      /* Disable Wrapping */
+            white-space: pre;       /* Disable Wrapping */
             overflow: auto;        /* Enable Both Scrolls on the PANE */
             
-            /* --- CHANGED: Remove Wrapping Logic --- */
+            /* --- Remove Wrapping Logic --- */
             overflow-wrap: normal;
             word-break: normal;
             
@@ -316,11 +317,11 @@
             will-change: scroll-position;
         }
 
-        /* --- FIX #1: Normalize Text Rendering --- 
+        /* --- Normalize Text Rendering --- 
            Force the textarea and the div to calculate width and spacing identically 
         */
         #text-input, #token-visualizer, .t-token {
-            line-height: 24px !important;
+            line-height: var(--strict-line-height) !important;
             font-size: 16px; /* Ensure font fits within line-height */
             font-family: 'Consolas', 'Monaco', monospace;
         }
@@ -421,7 +422,7 @@
             height: 100%; /* Fill grid cell */
             overflow: hidden; /* Contain inner scroll */
             
-            /* --- FIX #2: Equalize Pixel Debt --- */
+            /* --- Equalize Pixel Debt --- */
             border-left: 1px solid transparent; 
         }
 
@@ -453,7 +454,7 @@
             box-decoration-break: clone;
             -webkit-box-decoration-break: clone;
 
-            /* --- FIX #3: Kill Token Margins --- */
+            /* --- Kill Token Margins --- */
             margin: 0; 
             box-shadow: 0 0 0 1px #ffffff; /* Simulates a 1px white gap visually */
         }
@@ -516,7 +517,6 @@
                 <input type="file" id="json-upload" accept=".json" style="display:none;">
             </div>
 
-            <!-- ADDED: Initial screen hint for downloading o200k_base.json -->
             <div class="load-hint">
                 Download <code>o200k_base.json</code> (filesize 2,325,547 bytes) from:<br>
                 <a href="https://tiktoken.pages.dev/js/o200k_base.json" target="_blank" rel="noopener noreferrer">
@@ -573,7 +573,6 @@
         </div>
     </div>
 
-    <!-- Custom tooltip for tokens (we don't rely on native title tooltips so this works in desktop browsers reliably) -->
     <div id="token-tooltip" class="token-tooltip hidden"></div>
 
     <script id="worker-script" type="javascript/worker">
@@ -678,7 +677,7 @@
                 });
             }
 
-            // Returns { count: number, segments: string[], tokenIds: number[] }
+            // Returns { count: number, segments: string[], tokenIds: number[], tokenSourceLengths: Uint32Array }
             encodeAndSegment(text) {
                 // NOTE: We deliberately ignore JSON `special_tokens` and treat those strings as plain text.
                 // This UI tokenizes a single prompt buffer, not a multi-message request/response chain format,
@@ -686,6 +685,10 @@
 
                 const segments = [];
                 const tokenIds = [];
+                // We track the exact UTF-16 source length contribution of each token. 
+                // This is critical for keeping the input textarea (UTF-16) and visualizer (UTF-8 decoded tokens)
+                // in perfect scroll sync, especially when emojis or other wide characters get split into multiple byte-tokens.
+                const tokenSourceLengths = []; 
                 let count = 0;
 
                 // Reset the regex state for this encoding run.
@@ -694,14 +697,21 @@
                 let match;
                 while ((match = this.pieceRegex.exec(text)) !== null) {
                     const pieceStr = match[0];
+                    const pieceLen = pieceStr.length; // Source length in UTF-16 code units (e.g. Emoji = 2)
+
                     const pieceBytes = this.textEncoder.encode(pieceStr);
                     const directKey = pieceBytes.join(",");
                     const directRank = this.rankMap.get(directKey);
+
+                    // We need to track how many tokens this one regex match produces,
+                    // so we can distribute the source length 'pieceLen' correctly among them.
+                    let generatedCount = 0;
 
                     if (directRank !== undefined) {
                         // Whole piece is a single known token.
                         segments.push(this.textDecoder.decode(pieceBytes));
                         tokenIds.push(directRank);
+                        generatedCount = 1;
                         count++;
                     } else {
                         // Need to perform BPE split and map each span to a token id.
@@ -714,15 +724,43 @@
                                     `BPE split produced a byte sequence with no rank: "${key}". ` +
                                     `This should be impossible if bpe_ranks covers all merges and single-byte tokens.`
                                 );
-                                }
+                            }
                             segments.push(this.textDecoder.decode(sb));
                             tokenIds.push(rank);
+                            generatedCount++;
                             count++;
+                        }
+                    }
+
+                    // --- Source Length Distribution Logic ---
+                    // Example: An emoji (len 2) might split into 4 byte-tokens.
+                    // Visualizer sees 4 tokens (length 4 visual chars, often replacement chars).
+                    // Source text only advanced by 2.
+                    // We distribute the 2 source units across the 4 tokens (e.g. 1, 1, 0, 0)
+                    // ensuring the sum matches the source exactly.
+                    let remaining = pieceLen;
+                    for (let k = 0; k < generatedCount; k++) {
+                        // If it's the last token of this group, it absorbs any remaining length (for safety).
+                        // Otherwise, we greedily assign 1 unit of length until we run out.
+                        if (k === generatedCount - 1) {
+                            tokenSourceLengths.push(remaining);
+                        } else {
+                            const val = remaining > 0 ? 1 : 0;
+                            tokenSourceLengths.push(val);
+                            remaining -= val;
                         }
                     }
                 }
 
-                return { count, segments, tokenIds };
+                // Return buffers to allow zero-copy transfer where possible
+                const lengthsBuffer = new Uint32Array(tokenSourceLengths);
+
+                return { 
+                    count, 
+                    segments, 
+                    tokenIds, 
+                    tokenSourceLengths: lengthsBuffer 
+                };
             }
         }
 
@@ -746,8 +784,9 @@
                         count: result.count,
                         segments: result.segments,
                         tokenIds: result.tokenIds,
+                        tokenSourceLengths: result.tokenSourceLengths, // Pass the corrected lengths back
                         requestId: msg.requestId 
-                    });
+                    }, [result.tokenSourceLengths.buffer]); // Transfer ownership of the large buffer
                 } catch (err) {
                     self.postMessage({ type: 'error', message: err.message });
                 }
@@ -813,6 +852,7 @@
         let currentRequestId = 0;
         let pendingSegments = null;
         let pendingTokenIds = null;
+        let pendingSourceLengths = null;
         let virtualUpdateTimeout = null;
         const VIRTUAL_DEBOUNCE_MS = 10; // Fast response
     
@@ -995,13 +1035,13 @@
         els.fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
     
         // --- STATE BUILDING ---
-        function rebuildTokenState(text, segments, tokenIds) {
+        function rebuildTokenState(text, segments, tokenIds, tokenSourceLengths) {
             tokenState.segments = Array.isArray(segments) ? segments.slice() : [];
             tokenState.tokenIds = Array.isArray(tokenIds) ? tokenIds.slice() : [];
             tokenState.textSnapshot = text;
             tokenState.textLength = text.length;
             
-            // Normalize length mismatch defensively (shouldn't happen, but fail-soft if it does)
+            // Normalize length mismatch defensively (shouldn't happen with the fix, but fail-soft if it does)
             if (tokenState.tokenIds.length && tokenState.tokenIds.length !== tokenState.segments.length) {
                 const minLen = Math.min(tokenState.segments.length, tokenState.tokenIds.length);
                 tokenState.segments.length = minLen;
@@ -1022,9 +1062,19 @@
             tokenState.tokenStartIndices = new Uint32Array(len);
             tokenState.tokenEndIndices = new Uint32Array(len);
             let runningLength = 0;
+            
+            // Safety check: Ensure we actually received the source length data from the worker
+            const hasSourceData = tokenSourceLengths && tokenSourceLengths.length === len;
+
             for (let i = 0; i < len; i++) {
                 tokenState.tokenStartIndices[i] = runningLength;
-                runningLength += tokenState.segments[i].length;
+                
+                // CRITICAL: We use the source length provided by the worker (which distributes UTF-16 units correctly)
+                // instead of the decoded segment length (which might be inflated due to replacement chars).
+                // If data is missing (legacy path), we fall back to segment.length, accepting potential drift.
+                const segLen = hasSourceData ? tokenSourceLengths[i] : tokenState.segments[i].length;
+                
+                runningLength += segLen;
                 tokenState.tokenEndIndices[i] = runningLength;
             }
 
@@ -1158,7 +1208,10 @@
             /* --- FIX: Stabilize the Spacer Calculation ---
                We need to know where this token *actually* starts to set the spacer.
                Using the token's true start char keeps spacer height consistent and
-               avoids off-by-one line drift.
+               avoids off-by-one line drift. 
+               
+               Since we now have the true source indices (thanks to tokenSourceLengths), 
+               getLineForCharIndex will return the exact physical line in the textarea.
             */
             let tokenStartChar = 0;
             if (startTokenIndex > 0) {
@@ -1294,7 +1347,7 @@
             currentRequestId++;
             if (text.length === 0) {
                 updateTokenStats(0);
-                rebuildTokenState("", [], []);
+                rebuildTokenState("", [], [], []);
                 if (els.tokenInner) {
                     els.tokenInner.innerHTML = '';
                 }
@@ -1322,7 +1375,8 @@
     
         els.computeBtn.addEventListener('click', () => {
             if (pendingSegments && pendingTokenIds) {
-                rebuildTokenState(els.input.value || "", pendingSegments, pendingTokenIds);
+                // Pass the pending source lengths as well to maintain sync logic
+                rebuildTokenState(els.input.value || "", pendingSegments, pendingTokenIds, pendingSourceLengths);
                 setSyncState('synced');
             }
         });
@@ -1383,7 +1437,14 @@
                     updateTokenStats(msg.count);
                     pendingSegments = msg.segments;
                     pendingTokenIds = msg.tokenIds || [];
-                    rebuildTokenState(els.input.value || "", msg.segments, msg.tokenIds || []);
+                    pendingSourceLengths = msg.tokenSourceLengths || []; // Receive Source Length Buffer
+                    
+                    rebuildTokenState(
+                        els.input.value || "", 
+                        msg.segments, 
+                        msg.tokenIds || [], 
+                        msg.tokenSourceLengths
+                    );
                     setSyncState('synced');
                 }
             } else if (msg.type === 'error') {
